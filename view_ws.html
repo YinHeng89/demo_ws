@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>WebSocket JPEG Preview</title>
+  <style>
+    body { font-family: Arial, Helvetica, sans-serif; background:#111; color:#eee; display:flex; flex-direction:column; align-items:center; padding:12px }
+    #preview { background:#222; max-width:100%; height:auto; border:1px solid #444 }
+    .info { margin-top:8px; color:#bdbdbd }
+    .badge { display:inline-block; padding:4px 8px; background:#222; border:1px solid #333; margin-right:8px }
+  </style>
+</head>
+<body>
+  <h3>WebSocket 即时画面预览</h3>
+  <canvas id="preview" width="640" height="480" style="background:#222; border:1px solid #444"></canvas>
+  <div class="info">
+    <span class="badge">地址: <code id="url">ws://localhost:9000/ws/view</code></span>
+    <span class="badge">每秒帧数: <strong id="recv">0</strong></span>
+    <span class="badge">最近大小: <strong id="size">0</strong> 字节</span>
+  </div>
+
+  <script>
+    // 配置：修改为你的 WS 地址（默认本地演示）
+    const WS_URL = 'ws://localhost:9000/ws/view';
+
+    document.getElementById('url').textContent = WS_URL;
+    const img = document.getElementById('preview');
+
+    let ws;
+    const canvas = document.getElementById('preview');
+    const ctx = canvas.getContext('2d');
+
+    // 统计接收速率
+    let recvCount = 0;
+    let recvLast = 0;
+    setInterval(() => {
+      document.getElementById('recv').textContent = recvCount - recvLast;
+      recvLast = recvCount;
+    }, 1000);
+
+    function connect() {
+      ws = new WebSocket(WS_URL);
+      ws.binaryType = 'arraybuffer';
+
+      ws.onopen = () => {
+        console.log('WebSocket 已连接');
+      };
+
+      ws.onerror = (e) => {
+        console.error('WebSocket 错误', e);
+      };
+
+      ws.onclose = () => {
+        console.warn('WebSocket 已关闭，1 秒后重连');
+        setTimeout(connect, 1000);
+      };
+
+      ws.onmessage = (evt) => {
+        const ab = evt.data;
+        if (!(ab instanceof ArrayBuffer)) return;
+        recvCount += 1;
+        document.getElementById('size').textContent = ab.byteLength;
+
+        // 优先使用 createImageBitmap 把二进制解码为 ImageBitmap 并绘制到 canvas，
+        // 这样不会创建可在 Network 面板看到的 blob:null URL。
+        const blob = new Blob([ab], { type: 'image/jpeg' });
+        if (window.createImageBitmap) {
+          createImageBitmap(blob).then(bitmap => {
+            // 根据 canvas 大小绘制并保持纵横比
+            try {
+              ctx.clearRect(0,0,canvas.width,canvas.height);
+              ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+            } finally {
+              bitmap.close();
+            }
+          }).catch(err => {
+            console.error('createImageBitmap error', err);
+            // 回退：使用 FileReader 生成 data URL
+            const fr = new FileReader();
+            fr.onload = () => {
+              const imgEl = new Image();
+              imgEl.onload = () => { ctx.drawImage(imgEl,0,0,canvas.width,canvas.height); };
+              imgEl.src = fr.result;
+            };
+            fr.readAsDataURL(blob);
+          });
+        } else {
+          // 兼容回退到 data URL
+          const fr = new FileReader();
+          fr.onload = () => {
+            const imgEl = new Image();
+            imgEl.onload = () => { ctx.drawImage(imgEl,0,0,canvas.width,canvas.height); };
+            imgEl.src = fr.result;
+          };
+          fr.readAsDataURL(blob);
+        }
+      };
+    }
+
+    connect();
+
+    // 页面卸载时清理
+    window.addEventListener('beforeunload', () => {
+      if (ws && ws.readyState === WebSocket.OPEN) ws.close();
+      if (lastBlobUrl) URL.revokeObjectURL(lastBlobUrl);
+    });
+  </script>
+</body>
+</html>
