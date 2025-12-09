@@ -12,7 +12,7 @@
 
 import asyncio
 import os
-from typing import Set
+from typing import Set, Dict, Optional
 from contextlib import asynccontextmanager
 
 import cv2
@@ -54,8 +54,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-# 已连接的 WebSocket 客户端
-_clients: Set[WebSocket] = set()
+# 已连接的 WebSocket 客户端映射：ws -> {'queue': Queue, 'task': Task}
+_clients: Dict[WebSocket, dict] = {}
 _clients_lock = asyncio.Lock()
 
 # 后台采集任务状态
@@ -115,15 +115,25 @@ async def _broadcast_loop(stop_event: asyncio.Event):
 
             if success:
                 data = buf.tobytes()
-                # 向已连接客户端广播当前帧快照
+                # 向已连接客户端广播当前帧快照：将数据非阻塞放入每个客户端的队列。
                 async with _clients_lock:
-                    clients = list(_clients)
-                for ws in clients:
+                    clients_items = list(_clients.items())
+                for ws, info in clients_items:
+                    q: asyncio.Queue = info.get('queue')
+                    if q is None:
+                        continue
                     try:
-                        await ws.send_bytes(data)
-                    except Exception:
-                        # 忽略发送错误；客户端断开连接将在 handler 中处理
-                        pass
+                        # 非阻塞放入，若队满则丢弃旧帧后再放入（覆盖策略）
+                        q.put_nowait(data)
+                    except asyncio.QueueFull:
+                        try:
+                            _ = q.get_nowait()
+                        except Exception:
+                            pass
+                        try:
+                            q.put_nowait(data)
+                        except Exception:
+                            pass
 
             await asyncio.sleep(interval)
     finally:
@@ -135,12 +145,32 @@ async def _broadcast_loop(stop_event: asyncio.Event):
 
 @app.websocket("/ws/view")
 async def ws_view(websocket: WebSocket):
-    """Simple websocket endpoint: accepts connections and keeps them registered
-    so the background capture task can push frames to them.
-    """
+    """WebSocket 处理：为每个连接创建有界队列与单独发送任务，
+    广播器将帧放入队列，由发送任务负责实际写入网络，避免慢客户端阻塞全局广播。"""
     await websocket.accept()
+    queue: asyncio.Queue = asyncio.Queue(maxsize=1)  # 保留最新帧
+
+    async def _client_sender_loop(ws: WebSocket, q: asyncio.Queue):
+        # 单独的发送任务：从队列取帧并发送，发送操作带超时保护
+        try:
+            while True:
+                data = await q.get()
+                try:
+                    await asyncio.wait_for(ws.send_bytes(data), timeout=1.0)
+                except (asyncio.TimeoutError, Exception):
+                    # 若发送失败或超时，尝试关闭连接并退出
+                    try:
+                        await ws.close()
+                    except Exception:
+                        pass
+                    break
+        except asyncio.CancelledError:
+            return
+
+    sender_task = asyncio.create_task(_client_sender_loop(websocket, queue))
     async with _clients_lock:
-        _clients.add(websocket)
+        _clients[websocket] = {'queue': queue, 'task': sender_task}
+
     try:
         # 保持连接直到客户端断开；不期望收到客户端消息。
         while True:
@@ -149,11 +179,15 @@ async def ws_view(websocket: WebSocket):
             except WebSocketDisconnect:
                 break
             except Exception:
-                # 忽略其他接收错误；循环以便检测断开
                 await asyncio.sleep(0.1)
     finally:
+        # 清理该客户端状态
         async with _clients_lock:
-            _clients.discard(websocket)
+            info = _clients.pop(websocket, None)
+        if info is not None:
+            task = info.get('task')
+            if task is not None:
+                task.cancel()
 
 
 @app.get('/viewer', response_class=HTMLResponse)
