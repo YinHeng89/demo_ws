@@ -30,6 +30,21 @@ uvicorn server:app --host 0.0.0.0 --port 9000
 python client.py --uri ws://localhost:9000/ws/stream --fps 5
 ```
 
+可选：在单进程中让 `server.py` 直接从本地摄像头采集并供 `/ws/view` 使用（无需运行 `client.py`）。有两种方式启用：
+
+- 环境变量方式（适用于 `uvicorn server:app`）：
+
+```powershell
+# PowerShell 示例：启用本地采集
+$env:LOCAL_CAPTURE=1; $env:LOCAL_CAPTURE_FPS=5; uvicorn server:app --host 0.0.0.0 --port 9000
+```
+
+- 或直接运行 `server.py` 并传入参数（适用于双击或 `python server.py`）:
+
+```powershell
+python server.py --with-local-capture --device 0 --fps 5 --width 640 --height 480
+```
+
 4) 结果
 - 服务端会弹出 `Server Preview` 窗口，显示接收到的最新帧。
 - 客户端会弹出 `Client Preview` 窗口，显示本地摄像头采集的画面。
