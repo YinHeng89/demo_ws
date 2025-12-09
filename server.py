@@ -214,7 +214,7 @@ if __name__ == '__main__':
         raise
 
     parser = argparse.ArgumentParser(description='Run minimal WebSocket JPEG broadcaster')
-    parser.add_argument('--host', type=str, default='localhost', help='Host to bind')
+    parser.add_argument('--host', type=str, default='0.0.0.0', help='Host to bind')
     parser.add_argument('--port', type=int, default=9000, help='Port to bind')
     args = parser.parse_args()
 
