@@ -20,6 +20,10 @@ import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from pathlib import Path
+import threading
+import socketserver
+import http.server
+import time
 
 
 # 配置（仅保留一个环境变量）
@@ -41,6 +45,10 @@ async def lifespan(app: FastAPI):
 
     stop = asyncio.Event()
     task = asyncio.create_task(_broadcast_loop(stop))
+    # 如果环境变量指定 MJPEG 端口，则启动独立的 socketserver MJPEG 服务
+    mjpeg_server_obj = None
+    if _MJPEG_PORT > 0:
+        mjpeg_server_obj = _start_mjpeg_server(_MJPEG_PORT)
     print("采集广播器已启动；WebSocket 可通过 http://127.0.0.1:9000/viewer 访问")
     try:
         yield
@@ -48,6 +56,13 @@ async def lifespan(app: FastAPI):
         stop.set()
         try:
             await task
+        except Exception:
+            pass
+        # 关闭 MJPEG 独立服务器（若存在）
+        try:
+            if _mjpeg_server is not None:
+                _mjpeg_server.shutdown()
+                _mjpeg_server.server_close()
         except Exception:
             pass
 
@@ -61,6 +76,16 @@ _clients_lock = asyncio.Lock()
 # 后台采集任务状态
 _capture_task: asyncio.Task | None = None
 _capture_stop: asyncio.Event | None = None
+
+# 全局单槽最新帧（供 MJPEG HTTP 服务器读取）
+_latest_frame_bytes: bytes | None = None
+_latest_frame_lock = threading.Lock()
+
+# 可通过环境变量启动独立的 MJPEG HTTP 服务器（socketserver 风格）
+# 默认端口设为 8081；若设置为 '0' 则禁用独立 MJPEG 服务。
+_MJPEG_PORT = int(os.getenv('MJPEG_PORT', '8081'))
+_mjpeg_server: socketserver.ThreadingTCPServer | None = None
+
 
 
 async def _broadcast_loop(stop_event: asyncio.Event):
@@ -115,6 +140,13 @@ async def _broadcast_loop(stop_event: asyncio.Event):
 
             if success:
                 data = buf.tobytes()
+                # 更新全局单槽最新帧（线程安全）
+                try:
+                    with _latest_frame_lock:
+                        global _latest_frame_bytes
+                        _latest_frame_bytes = data
+                except Exception:
+                    pass
                 # 向已连接客户端广播当前帧快照：将数据非阻塞放入每个客户端的队列。
                 async with _clients_lock:
                     clients_items = list(_clients.items())
@@ -201,6 +233,88 @@ async def viewer_page():
 
 
 # 上方的 lifespan 处理器负责采集广播器的启动/关闭。
+class _ThreadedTCPServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    def handle_error(self, request, client_address):
+        # 屏蔽常见的连接中止/重置等异常，避免控制台打印完整回溯信息
+        import sys
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionAbortedError, ConnectionResetError, BrokenPipeError)):
+            return
+        # 其他异常使用基类默认处理（会打印 traceback）
+        return super().handle_error(request, client_address)
+
+
+class MJPEGHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+
+    def log_message(self, format, *args):
+        # 静默日志，避免控制台过多输出
+        return
+
+    def do_GET(self):
+        if self.path != '/stream':
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        boundary = b'frame'
+        self.send_response(200)
+        self.send_header('Age', '0')
+        self.send_header('Cache-Control', 'no-cache, private')
+        self.send_header('Pragma', 'no-cache')
+        self.send_header('Content-Type', f'multipart/x-mixed-replace; boundary={boundary.decode()}')
+        self.end_headers()
+
+        # 持续发送最新帧直到客户端断开或服务器关闭
+        try:
+            while True:
+                # 读取最新帧
+                frame = None
+                try:
+                    with _latest_frame_lock:
+                        frame = _latest_frame_bytes
+                except Exception:
+                    frame = None
+
+                if frame:
+                    try:
+                        part = b'--' + boundary + b'\r\n'
+                        part += b'Content-Type: image/jpeg\r\n'
+                        part += b'Content-Length: ' + str(len(frame)).encode() + b'\r\n\r\n'
+                        self.wfile.write(part)
+                        self.wfile.write(frame)
+                        self.wfile.write(b'\r\n')
+                        self.wfile.flush()
+                    except BrokenPipeError:
+                        break
+                    except ConnectionResetError:
+                        break
+                    except Exception:
+                        break
+                # 按采集帧率间隔发送
+                time.sleep(max(0.01, 1.0 / max(1.0, float(_CAPTURE_FPS))))
+        finally:
+            try:
+                pass
+            except Exception:
+                pass
+
+
+def _start_mjpeg_server(port: int):
+    global _mjpeg_server
+    try:
+        server = _ThreadedTCPServer(('0.0.0.0', port), MJPEGHandler)
+    except Exception as e:
+        print(f'Failed to start MJPEG server on port {port}: {e}')
+        return None
+
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    _mjpeg_server = server
+    print(f'MJPEG server running at http://0.0.0.0:{port}/stream')
+    return server
+
 
 
 # 无 CLI 或额外端点；应用故意保持精简。
